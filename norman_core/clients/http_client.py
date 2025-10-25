@@ -1,30 +1,53 @@
 from typing import Optional
+from typing_extensions import Unpack
 
 import httpx
 from httpx import Response
 from norman_objects.shared.security.sensitive import Sensitive
-from typing_extensions import Unpack
+from norman_utils_external.singleton import Singleton
 
 from norman_core._app_config import AppConfig
 from norman_core.clients.objects.request_kwargs import RequestKwargs
 from norman_core.clients.objects.response_encoding import ResponseEncoding
 
 
-class HttpClient:
+class HttpClient(metaclass=Singleton):
     def __init__(self, base_url: Optional[str] = None, timeout: Optional[float] = None):
+        self._client = None
+
         if base_url is None:
-            base_url = AppConfig.http.base_url
+            self._base_url = AppConfig.http.base_url
+        else:
+            self._base_url = base_url
+
         if timeout is None:
-            timeout = AppConfig.http.timeout_seconds
+            self._timeout = AppConfig.http.timeout_seconds
+        else:
+            self._timeout = timeout
 
         self._headers = {
             "Content-Type": "application/json"
         }
 
+    async def open(self):
+        await self.close()
         self._client = httpx.AsyncClient(
-            base_url=base_url,
-            timeout=timeout
+            base_url=self._base_url,
+            timeout=self._timeout
         )
+
+    async def close(self):
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+
+    async def __aenter__(self):
+        await self.open()
+        await self._client.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._client is not None:
+            await self._client.__aexit__(exc_type, exc, tb)
 
     async def request(self, method: str, endpoint: str, token: Optional[Sensitive[str]] = None, *, response_encoding = ResponseEncoding.Json, **kwargs: Unpack[RequestKwargs]):
         headers = self._create_headers(token)
@@ -74,7 +97,28 @@ class HttpClient:
 
     @staticmethod
     def _parse_response(response: httpx.Response, response_encoding: ResponseEncoding):
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            try:
+                method = e.request.method
+                url = e.request.url
+                status_code = e.response.status_code
+                detail = e.response.json()
+            except Exception:
+                method = e.request.method
+                url = e.request.url
+                status_code = e.response.status_code
+                detail = e.response.text
+
+            message = f"""
+                f"Request failed\n"
+                f"Method: {method}\n"
+                f"URL: {url}\n"
+                f"Status: {status_code}\n"
+                f"Detail: {detail}"
+            """
+            raise Exception(message) from e
 
         if response_encoding == ResponseEncoding.Bytes:
             return response.content
@@ -94,17 +138,3 @@ class HttpClient:
                     yield chunk
         finally:
             await response.aclose()
-
-    async def close(self):
-        await self._client.aclose()
-
-    async def __aenter__(self):
-        await self._client.__aenter__()
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        await self._client.__aexit__(exc_type, exc, tb)
-        return self
-
-    def __repr__(self):
-        return f"<Norman.ApiClient base_url={self._client.base_url} closed={self._client.is_closed}>"
